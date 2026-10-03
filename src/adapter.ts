@@ -3,10 +3,10 @@
  *
  * Pipeline (run before calling buildSpec):
  *   0. Enrich artifact with Gemma-generated image prompts (parallel)
- *   1. TTS per scene → audio files with durations (ElevenLabs or edge-tts)
+ *   1. TTS per scene → audio files with durations (edge-tts)
  *   2. Scene durations = max(artifact.duration, audioDuration + 0.4), min 2.5s
- *   3. Generate per-scene background PNGs
- *   4. Generate background music (ElevenLabs or fallback loop.mp3)
+ *   3. Generate per-scene background PNGs (Pollinations AI, parallel)
+ *   4. Set background music (fallback loop.mp3)
  *   5. Build spec with remotionMeta attached
  */
 import path from "path";
@@ -20,10 +20,6 @@ import {
 } from "./backgrounds.js";
 import { synthesize, ttsAvailable } from "./tts.js";
 import { enrichArtifactWithImagePrompts } from "./imageprompt.js";
-import {
-  elevenlabsAvailable,
-  elevenLabsMusic,
-} from "./elevenlabs.js";
 import { generateImage } from "./imagegen.js";
 import type { RemotionSceneMeta, ExtendedElahSpec } from "./renderRemotionVideo.js";
 
@@ -56,23 +52,6 @@ interface ElahClip {
 
 const FALLBACK_MUSIC_PATH = path.join(process.cwd(), "assets", "music", "loop.mp3");
 
-// Mood → music prompt mapping for ElevenLabs text-to-music
-const MUSIC_PROMPTS: Record<string, string> = {
-  energetic: "Upbeat energetic electronic dance music, driving beat, modern commercial, high energy",
-  calm: "Calm ambient background music, soft piano and strings, peaceful, corporate",
-  premium: "Cinematic orchestral music, luxury brand feel, elegant and sophisticated, modern",
-  playful: "Fun upbeat playful music, quirky and cheerful, bright ukulele and claps",
-};
-
-function buildMusicPrompt(mood: string, campaignType: string): string {
-  const base = MUSIC_PROMPTS[mood] ?? MUSIC_PROMPTS.energetic;
-  // Add campaign-type flavour
-  if (campaignType === "discount" || campaignType === "event") {
-    return `${base}, sense of urgency, promotional`;
-  }
-  return `${base}, promotional background`;
-}
-
 export async function buildSpec(
   artifact: VideoArtifact,
   assetPaths: Record<string, string>, // id → absolute file path
@@ -91,7 +70,7 @@ export async function buildSpec(
     console.warn(`[adapter] Image prompt generation failed, continuing without: ${(err as Error).message}`);
   }
 
-  // ── 1. TTS per scene ───────────────────────────────────────────────────────
+  // ── 1. TTS per scene (edge-tts) ───────────────────────────────────────────
   const audioDurations: number[] = [];
   const audioFiles: (string | null)[] = [];
 
@@ -121,28 +100,36 @@ export async function buildSpec(
     duration: Math.max(2.5, scene.duration, audioDurations[i] + 0.4),
   }));
 
-  // ── 3. Per-scene background images (AI-generated, gradient fallback) ──────
-  const bgPaths: string[] = [];
-  for (let i = 0; i < scenes.length; i++) {
-    const bgPath = path.join(workDir, `bg_${i + 1}.png`);
-    const imagePrompt = enrichedArtifact.scenes[i].image_prompt;
+  // ── 3. Per-scene background images (AI-generated, parallel) ───────────────
+  console.log(`[adapter] Generating background images for ${scenes.length} scenes...`);
+  const bgPaths = await Promise.all(
+    scenes.map(async (scene, i) => {
+      const bgPath = path.join(workDir, `bg_${i + 1}.png`);
+      const imagePrompt = scene.image_prompt;
 
-    let generated = false;
-    if (imagePrompt) {
-      generated = await generateImage(imagePrompt, stage.width, stage.height, bgPath);
-    }
+      let generated = false;
+      if (imagePrompt) {
+        generated = await generateImage(
+          imagePrompt,
+          stage.width,
+          stage.height,
+          bgPath,
+          enrichedArtifact.campaign.product_name
+        );
+      }
 
-    if (!generated) {
-      // Fallback: gradient PNG
-      await generateGradient(
-        enrichedArtifact.style.palette.bg1,
-        enrichedArtifact.style.palette.bg2,
-        stage,
-        bgPath
-      );
-    }
-    bgPaths.push(bgPath);
-  }
+      if (!generated) {
+        // Fallback: gradient PNG
+        await generateGradient(
+          enrichedArtifact.style.palette.bg1,
+          enrichedArtifact.style.palette.bg2,
+          stage,
+          bgPath
+        );
+      }
+      return bgPath;
+    })
+  );
   console.log(`[adapter] Background images generated for ${scenes.length} scenes`);
 
   // ── 4. Build spec ─────────────────────────────────────────────────────────
@@ -171,29 +158,9 @@ export async function buildSpec(
   for (const s of scenes) totalDuration += s.duration;
   totalDuration = parseFloat(totalDuration.toFixed(3));
 
-  // ── 4. Background music (ElevenLabs or fallback) ──────────────────────────
-  if (musicEnabled) {
-    let musicPath = FALLBACK_MUSIC_PATH;
-
-    if (elevenlabsAvailable()) {
-      const genMusicPath = path.join(workDir, "music_gen.mp3");
-      try {
-        const prompt = buildMusicPrompt(
-          enrichedArtifact.style.mood,
-          enrichedArtifact.campaign.type
-        );
-        await elevenLabsMusic(prompt, genMusicPath, {
-          durationSeconds: Math.ceil(totalDuration) + 2, // slight overrun for fade
-        });
-        musicPath = genMusicPath;
-        console.log(`[adapter] Background music generated via ElevenLabs`);
-      } catch (err) {
-        console.warn(`[adapter] ElevenLabs music failed, using fallback: ${(err as Error).message}`);
-        // musicPath stays as FALLBACK_MUSIC_PATH
-      }
-    }
-
-    assets["music"] = musicPath;
+  // Background music
+  if (musicEnabled && existsSync(FALLBACK_MUSIC_PATH)) {
+    assets["music"] = FALLBACK_MUSIC_PATH;
   }
 
   // Build clips per scene
@@ -298,13 +265,13 @@ export async function buildSpec(
   }
 
   // Background music — single clip spanning the whole video
-  if (musicEnabled) {
+  if (musicEnabled && assets["music"]) {
     clips.push({
       track: "audio",
       asset: "music",
       start: 0,
       duration: totalDuration,
-      volume: enrichedArtifact.music.volume,
+      volume: enrichedArtifact.music.volume ?? 0.2,
     });
   }
 

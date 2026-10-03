@@ -1,20 +1,31 @@
 /**
  * Render router.
  *
- * RENDER_ENGINE=remotion  → Remotion / React composition (animated, layered)
- * RENDER_ENGINE=elah      → ELAH library API (default, backward-compatible)
- * ELAH_RENDER_PORT set    → ELAH HTTP server (legacy)
+ * RENDER_ENGINE=ffmpeg     → FFmpeg filter_complex (DEFAULT — works everywhere)
+ * RENDER_ENGINE=remotion   → Remotion / React composition (animated, layered)
+ * RENDER_ENGINE=elah       → ELAH library API (legacy)
+ * ELAH_RENDER_PORT set     → ELAH HTTP server (legacy)
  *
- * The Remotion path is the new default for production; ELAH is kept so
- * existing deployments continue to work without any env changes.
+ * FFmpeg is the default because it requires no browser, no Chromium download,
+ * and works reliably with the ffmpeg already on PATH.
  */
 import { writeFile } from "fs/promises";
 import path from "path";
 import type { ElahSpec } from "./adapter.js";
 import type { ExtendedElahSpec } from "./renderRemotionVideo.js";
 
-const RENDER_ENGINE = process.env.RENDER_ENGINE ?? "remotion";
+const RENDER_ENGINE = process.env.RENDER_ENGINE ?? "ffmpeg";
 const HTTP_PORT = process.env.ELAH_RENDER_PORT;
+
+// ── FFmpeg renderer (default) ─────────────────────────────────────────────────
+async function renderViaFfmpeg(
+  spec: ElahSpec,
+  outPath: string,
+  jobId: string
+): Promise<void> {
+  const { renderWithFfmpeg } = await import("./renderFfmpeg.js");
+  await renderWithFfmpeg(spec, outPath, jobId);
+}
 
 // ── ELAH library API ──────────────────────────────────────────────────────────
 async function renderViaLibrary(
@@ -78,7 +89,7 @@ async function renderViaRemotion(
   outPath: string,
   jobId: string
 ): Promise<void> {
-  // Dynamic import keeps Remotion's large dep tree out of the ELAH path
+  // Dynamic import keeps Remotion's large dep tree out of the FFmpeg path
   const { renderRemotionVideo } = await import("./renderRemotionVideo.js");
   await renderRemotionVideo(spec, outPath, jobId);
 }
@@ -95,18 +106,24 @@ export async function render(
   const specPath = path.join(workDir, "spec.json");
   const outPath  = path.join(workDir, `${jobId}.mp4`);
 
-  // Always write spec.json for debugging / ELAH compat
+  // Always write spec.json for debugging
   await writeFile(specPath, JSON.stringify(spec, null, 2));
 
   if (RENDER_ENGINE === "remotion") {
     console.log(`[${jobId}] Using Remotion renderer`);
     await renderViaRemotion(spec as ExtendedElahSpec, outPath, jobId);
-  } else if (HTTP_PORT) {
-    console.log(`[${jobId}] Using ELAH HTTP renderer on port ${HTTP_PORT}`);
-    await renderViaHttp(spec, specPath, outPath);
+  } else if (RENDER_ENGINE === "elah") {
+    if (HTTP_PORT) {
+      console.log(`[${jobId}] Using ELAH HTTP renderer on port ${HTTP_PORT}`);
+      await renderViaHttp(spec, specPath, outPath);
+    } else {
+      console.log(`[${jobId}] Using ELAH library renderer`);
+      await renderViaLibrary(spec, specPath, outPath);
+    }
   } else {
-    console.log(`[${jobId}] Using ELAH library renderer`);
-    await renderViaLibrary(spec, specPath, outPath);
+    // Default: ffmpeg
+    console.log(`[${jobId}] Using FFmpeg renderer`);
+    await renderViaFfmpeg(spec, outPath, jobId);
   }
 
   return outPath;
