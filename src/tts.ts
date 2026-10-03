@@ -1,22 +1,28 @@
 /**
- * TTS provider — powered by edge-tts (Microsoft Neural TTS).
+ * TTS provider — routes to ElevenLabs (free premade voices) with automatic fallback to edge-tts.
  *
- * Uses `python -m edge_tts` subprocess to generate high-quality voiceovers
- * with zero cost, zero API keys, and dozens of natural voices.
+ * Priority:
+ *   1. ElevenLabs — if ELEVENLABS_API_KEY is configured (using free premade voices like Sarah/Liam)
+ *   2. edge-tts    — fallback if ElevenLabs quota is exhausted, errors, or fails
  *
  * Returns the output path and duration in seconds.
  */
 import { spawn } from "child_process";
 import { existsSync } from "fs";
 import ffmpeg from "fluent-ffmpeg";
+import {
+  elevenlabsAvailable,
+  elevenLabsTTS,
+} from "./elevenlabs.js";
 
-export type TTSProvider = "edge-tts";
+export type TTSProvider = "elevenlabs" | "edge-tts";
 
 /**
- * Synthesize text to speech using edge-tts.
+ * Synthesize text to speech.
+ * Automatically tries ElevenLabs first (free voices), then falls back to edge-tts.
  *
  * @param text   Text to speak
- * @param voice  Voice name (default: "en-US-AriaNeural")
+ * @param voice  Voice name for edge-tts (default: "en-US-AriaNeural")
  * @param outPath Destination audio path (.mp3)
  */
 export async function synthesize(
@@ -24,6 +30,18 @@ export async function synthesize(
   voice: string = "en-US-AriaNeural",
   outPath: string
 ): Promise<{ path: string; duration: number; provider: TTSProvider }> {
+  // 1. Try ElevenLabs free premade voice
+  if (elevenlabsAvailable()) {
+    try {
+      await elevenLabsTTS(text, outPath);
+      const duration = await probeDuration(outPath);
+      return { path: outPath, duration, provider: "elevenlabs" };
+    } catch (err) {
+      console.warn(`[tts] ElevenLabs failed, falling back to edge-tts: ${(err as Error).message}`);
+    }
+  }
+
+  // 2. Fallback: edge-tts
   await runEdgeTts(text, voice, outPath);
   const duration = await probeDuration(outPath);
   return { path: outPath, duration, provider: "edge-tts" };
@@ -65,8 +83,10 @@ export async function probeDuration(filePath: string): Promise<number> {
   });
 }
 
-// Check if edge-tts is available
+// Check if any TTS provider is available
 export async function ttsAvailable(): Promise<boolean> {
+  if (elevenlabsAvailable()) return true;
+
   return new Promise((resolve) => {
     const proc = spawn("python", ["-m", "edge_tts", "--version"]);
     proc.on("close", (code) => resolve(code === 0));

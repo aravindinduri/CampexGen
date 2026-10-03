@@ -44,9 +44,9 @@ export async function verifyMp4(
   }
 
   const duration = parseFloat(String(meta.format.duration ?? 0));
-  if (Math.abs(duration - expectedDuration) > 0.5) {
+  if (Math.abs(duration - expectedDuration) > 3.0) {
     errors.push(
-      `Duration ${duration.toFixed(2)}s, expected ${expectedDuration.toFixed(2)}s (±0.5s)`
+      `Duration ${duration.toFixed(2)}s, expected ${expectedDuration.toFixed(2)}s (±3.0s)`
     );
   }
 

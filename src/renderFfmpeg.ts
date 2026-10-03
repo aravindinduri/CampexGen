@@ -1,14 +1,13 @@
 /**
  * FFmpeg-based video renderer.
  *
- * Composes per-scene background images, text overlays, voiceover audio,
- * and background music into an MP4 using ffmpeg's filter_complex.
- *
- * This replaces both ELAH and Remotion with a single ffmpeg call that
- * works reliably on any system with ffmpeg installed.
+ * Composes per-scene background images, typography (Montserrat / Inter),
+ * dynamic screen transitions (xfade slideleft/smoothleft/fade), voiceover audio,
+ * and background music into an MP4.
  */
 import { spawn } from "child_process";
 import path from "path";
+import { existsSync } from "fs";
 import type { ElahSpec } from "./adapter.js";
 
 interface SceneInfo {
@@ -26,16 +25,31 @@ interface SceneInfo {
   voiceDuration: number;
 }
 
-function getFontFile(bold = false): string {
-  if (process.platform === "win32") {
-    return bold ? "/Windows/Fonts/arialbd.ttf" : "/Windows/Fonts/arial.ttf";
+// ── Typography resolution ───────────────────────────────────────────────────
+
+function getHeadlineFont(): string {
+  const local = path.join(process.cwd(), "assets", "fonts", "Montserrat-ExtraBold.ttf");
+  if (existsSync(local)) {
+    return local.replace(/\\/g, "/").replace(/^[A-Za-z]:/, "");
   }
-  return bold
-    ? "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+  return process.platform === "win32"
+    ? "/Windows/Fonts/arialbd.ttf"
+    : "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf";
+}
+
+function getSubtextFont(): string {
+  const local = path.join(process.cwd(), "assets", "fonts", "Inter-SemiBold.ttf");
+  if (existsSync(local)) {
+    return local.replace(/\\/g, "/").replace(/^[A-Za-z]:/, "");
+  }
+  return process.platform === "win32"
+    ? "/Windows/Fonts/arial.ttf"
     : "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf";
 }
 
-function wrapText(text: string, maxCharsPerLine = 22): string {
+// ── Text utilities ──────────────────────────────────────────────────────────
+
+function wrapText(text: string, maxCharsPerLine = 20): string {
   const words = text.split(/\s+/);
   const lines: string[] = [];
   let currentLine = "";
@@ -54,11 +68,24 @@ function wrapText(text: string, maxCharsPerLine = 22): string {
   return lines.join("\n");
 }
 
+function escapeText(text: string): string {
+  return text
+    .replace(/\\/g, "\\\\\\\\")
+    .replace(/'/g, "\\'")
+    .replace(/:/g, "\\:");
+}
+
+function hexToFfmpeg(hex: string): string {
+  if (!hex.startsWith("#")) return hex;
+  return hex.replace("#", "0x");
+}
+
+// ── Scene extraction ────────────────────────────────────────────────────────
+
 function extractScenes(spec: ElahSpec): SceneInfo[] {
   const { clips, assets } = spec;
   const scenes: SceneInfo[] = [];
 
-  // Find all background clips (ordered by start time)
   const bgClips = clips
     .filter((c) => c.track === "image" && c.asset && /^bg_\d+$/.test(c.asset))
     .sort((a, b) => a.start - b.start);
@@ -67,7 +94,6 @@ function extractScenes(spec: ElahSpec): SceneInfo[] {
     const idx = bgClip.asset!.replace("bg_", "");
     const bgPath = assets[bgClip.asset!];
 
-    // Find user image asset in this scene (if any)
     const userAssetClip = clips.find(
       (c) =>
         c.track === "image" &&
@@ -78,7 +104,6 @@ function extractScenes(spec: ElahSpec): SceneInfo[] {
     );
     const userAssetPath = userAssetClip?.asset ? assets[userAssetClip.asset] : undefined;
 
-    // Find text clips in this scene's time window
     const textClips = clips.filter(
       (c) =>
         c.track === "text" &&
@@ -89,7 +114,6 @@ function extractScenes(spec: ElahSpec): SceneInfo[] {
     const headlineClip = textClips[0];
     const subtextClip = textClips.length > 1 ? textClips[1] : undefined;
 
-    // Find voiceover
     const voClip = clips.find(
       (c) => c.track === "audio" && c.asset === `vo_${idx}`
     );
@@ -101,10 +125,10 @@ function extractScenes(spec: ElahSpec): SceneInfo[] {
       subtext: subtextClip?.text,
       start: bgClip.start,
       duration: bgClip.duration,
-      fontSize: headlineClip?.fontSize ?? 72,
-      subtextFontSize: subtextClip?.fontSize ?? 36,
+      fontSize: headlineClip?.fontSize ?? 76,
+      subtextFontSize: subtextClip?.fontSize ?? 38,
       textColor: headlineClip?.color ?? "#ffffff",
-      fontFamily: headlineClip?.fontFamily ?? "Arial",
+      fontFamily: headlineClip?.fontFamily ?? "Montserrat",
       voicePath: voClip ? assets[`vo_${idx}`] ?? null : null,
       voiceDuration: voClip?.duration ?? 0,
     });
@@ -113,19 +137,7 @@ function extractScenes(spec: ElahSpec): SceneInfo[] {
   return scenes;
 }
 
-// Escape text for ffmpeg drawtext filter
-function escapeText(text: string): string {
-  return text
-    .replace(/\\/g, "\\\\\\\\")
-    .replace(/'/g, "\\'")
-    .replace(/:/g, "\\:");
-}
-
-// Convert hex color to ffmpeg format (e.g., #ff6b35 → 0xff6b35)
-function hexToFfmpeg(hex: string): string {
-  if (!hex.startsWith("#")) return hex;
-  return hex.replace("#", "0x");
-}
+// ── Main render function ───────────────────────────────────────────────────
 
 export async function renderWithFfmpeg(
   spec: ElahSpec,
@@ -140,19 +152,25 @@ export async function renderWithFfmpeg(
     throw new Error("No scenes found in spec");
   }
 
-  const totalDuration = scenes.reduce((sum, s) => sum + s.duration, 0);
+  // Transition parameters
+  const TRANSITION_DURATION = scenes.length > 1 ? 0.45 : 0; // 450ms smooth transition
+  const TRANSITION_TYPES = ["slideleft", "smoothleft", "fade", "slideright", "wipeleft"];
 
-  // Find music
+  // Compute total duration taking into account transition overlap
+  const totalDuration =
+    scenes.reduce((sum, s) => sum + s.duration, 0) -
+    (scenes.length - 1) * TRANSITION_DURATION;
+
+  // Music clip
   const musicClip = clips.find(
     (c) => c.track === "audio" && c.asset === "music"
   );
   const musicPath = musicClip ? assets["music"] ?? null : null;
   const musicVolume = musicClip?.volume ?? 0.2;
 
-  // ── Build ffmpeg command ─────────────────────────────────────────────────
   const args: string[] = ["-y"];
 
-  // Inputs: scene background images
+  // ── Inputs: Scene backgrounds ──────────────────────────────────────────
   for (let i = 0; i < scenes.length; i++) {
     args.push(
       "-loop", "1",
@@ -161,7 +179,7 @@ export async function renderWithFfmpeg(
     );
   }
 
-  // Inputs: user asset images (if any)
+  // ── Inputs: User uploaded assets ───────────────────────────────────────
   const userAssetInputIndices: (number | null)[] = [];
   let inputIdx = scenes.length;
   for (const scene of scenes) {
@@ -173,7 +191,7 @@ export async function renderWithFfmpeg(
     }
   }
 
-  // Inputs: voiceover audio files
+  // ── Inputs: Voiceover audio files ──────────────────────────────────────
   const voiceInputIndices: (number | null)[] = [];
   for (const scene of scenes) {
     if (scene.voicePath) {
@@ -184,33 +202,31 @@ export async function renderWithFfmpeg(
     }
   }
 
-  // Input: background music (if present)
+  // ── Input: Background music ────────────────────────────────────────────
   let musicInputIdx: number | null = null;
   if (musicPath) {
     args.push("-i", musicPath);
     musicInputIdx = inputIdx++;
   }
 
-  // ── filter_complex: compose scenes with text overlays ─────────────────
+  // ── Build Filtergraph ──────────────────────────────────────────────────
   const filters: string[] = [];
-  const concatInputs: string[] = [];
-
-  const fontBold = getFontFile(true);
-  const fontRegular = getFontFile(false);
+  const headlineFont = getHeadlineFont();
+  const subtextFont = getSubtextFont();
   const scaleRatio = width / 1080;
 
   for (let i = 0; i < scenes.length; i++) {
     const scene = scenes[i];
     const label = `scene${i}`;
 
-    // 1. Scale background image to cover stage dimensions
+    // 1. Scale & crop background to fill screen perfectly
     filters.push(
       `[${i}:v]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},setsar=1,fps=${fps}[bg${i}]`
     );
 
-    // 2. Add dark translucent overlay for text contrast
+    // 2. High-contrast gradient overlay (vignette/dim) for punchy text legibility
     filters.push(
-      `[bg${i}]drawbox=c=black@0.45:t=fill[dark${i}]`
+      `[bg${i}]drawbox=c=black@0.42:t=fill[dark${i}]`
     );
 
     let currentLayer = `dark${i}`;
@@ -218,68 +234,86 @@ export async function renderWithFfmpeg(
     // 3. User image overlay if present
     const userAssetIdx = userAssetInputIndices[i];
     if (userAssetIdx !== null) {
-      const targetW = Math.round(width * 0.7);
+      const targetW = Math.round(width * 0.72);
       filters.push(
         `[${userAssetIdx}:v]scale=${targetW}:-1:force_original_aspect_ratio=decrease[uimg${i}]`
       );
       filters.push(
-        `[${currentLayer}][uimg${i}]overlay=(W-w)/2:h*0.25:enable='gte(t,0.1)'[comp${i}]`
+        `[${currentLayer}][uimg${i}]overlay=(W-w)/2:h*0.22:enable='gte(t,0.1)'[comp${i}]`
       );
       currentLayer = `comp${i}`;
     }
 
-    // 4. Headline text with auto-wrapping
-    const wrappedHeadline = wrapText(scene.headline, 20);
+    // 4. Headline Typography (Montserrat ExtraBold) with drop shadow and fade-in
+    const wrappedHeadline = wrapText(scene.headline.toUpperCase(), 18);
     const escapedHeadline = escapeText(wrappedHeadline);
     const textColor = hexToFfmpeg(scene.textColor);
-    const headlineFontSize = Math.max(36, Math.round(scene.fontSize * scaleRatio));
+    const headlineFontSize = Math.max(42, Math.round(scene.fontSize * scaleRatio));
 
     const headlineY = scene.subtext
-      ? (userAssetIdx !== null ? `h*0.62` : `(h-text_h)/2 - 30`)
+      ? (userAssetIdx !== null ? `h*0.62` : `(h-text_h)/2 - 35`)
       : (userAssetIdx !== null ? `h*0.70` : `(h-text_h)/2`);
 
     filters.push(
-      `[${currentLayer}]drawtext=fontfile='${fontBold}':text='${escapedHeadline}':expansion=none:fontsize=${headlineFontSize}:fontcolor=${textColor}:line_spacing=12:x=(w-text_w)/2:y=${headlineY}:enable='gte(t,0.2)':alpha='if(lt(t,0.5),(t-0.2)/0.3,1)'[hl${i}]`
+      `[${currentLayer}]drawtext=fontfile='${headlineFont}':text='${escapedHeadline}':expansion=none:fontsize=${headlineFontSize}:fontcolor=${textColor}:line_spacing=14:shadowcolor=black@0.85:shadowx=4:shadowy=4:x=(w-text_w)/2:y=${headlineY}:enable='gte(t,0.15)':alpha='if(lt(t,0.5),(t-0.15)/0.35,1)'[hl${i}]`
     );
     currentLayer = `hl${i}`;
 
-    // 5. Subtext if present
+    // 5. Subtext Typography (Inter SemiBold) with subtle shadow and secondary fade-in
     if (scene.subtext) {
       const wrappedSubtext = wrapText(scene.subtext, 26);
       const escapedSubtext = escapeText(wrappedSubtext);
-      const subFontSize = Math.max(22, Math.round(scene.subtextFontSize * scaleRatio));
-      const subtextY = userAssetIdx !== null ? `h*0.78` : `(h-text_h)/2 + 65`;
+      const subFontSize = Math.max(24, Math.round(scene.subtextFontSize * scaleRatio));
+      const subtextY = userAssetIdx !== null ? `h*0.78` : `(h-text_h)/2 + 75`;
 
       filters.push(
-        `[${currentLayer}]drawtext=fontfile='${fontRegular}':text='${escapedSubtext}':expansion=none:fontsize=${subFontSize}:fontcolor=${textColor}@0.9:line_spacing=8:x=(w-text_w)/2:y=${subtextY}:enable='gte(t,0.3)':alpha='if(lt(t,0.6),(t-0.3)/0.3,1)'[${label}]`
+        `[${currentLayer}]drawtext=fontfile='${subtextFont}':text='${escapedSubtext}':expansion=none:fontsize=${subFontSize}:fontcolor=0xffffff@0.94:line_spacing=10:shadowcolor=black@0.75:shadowx=3:shadowy=3:x=(w-text_w)/2:y=${subtextY}:enable='gte(t,0.25)':alpha='if(lt(t,0.6),(t-0.25)/0.35,1)'[${label}]`
       );
     } else {
       filters.push(`[${currentLayer}]copy[${label}]`);
     }
-
-    concatInputs.push(`[${label}]`);
   }
 
-  // Concatenate all visual scenes
-  filters.push(
-    `${concatInputs.join("")}concat=n=${scenes.length}:v=1:a=0[video]`
-  );
+  // ── Screen Transitions (xfade) between scenes ──────────────────────────
+  if (scenes.length === 1) {
+    filters.push(`[scene0]copy[video]`);
+  } else {
+    let lastStream = "scene0";
+    let currentOffset = scenes[0].duration - TRANSITION_DURATION;
 
-  // ── Audio mixing ──────────────────────────────────────────────────────
+    for (let i = 1; i < scenes.length; i++) {
+      const transType = TRANSITION_TYPES[(i - 1) % TRANSITION_TYPES.length];
+      const outLabel = (i === scenes.length - 1) ? "video" : `xf${i}`;
+      filters.push(
+        `[${lastStream}][scene${i}]xfade=transition=${transType}:duration=${TRANSITION_DURATION}:offset=${currentOffset.toFixed(3)}[${outLabel}]`
+      );
+      lastStream = outLabel;
+      currentOffset += scenes[i].duration - TRANSITION_DURATION;
+    }
+  }
+
+  // ── Audio mixing with transition compensation ──────────────────────────
   const audioStreams: string[] = [];
 
   for (let i = 0; i < scenes.length; i++) {
     const vi = voiceInputIndices[i];
     if (vi !== null) {
-      const delay = Math.round(scenes[i].start * 1000); // ms
+      // Calculate scene start time taking into account xfade overlap
+      const visualStartTime =
+        i === 0
+          ? 0.1
+          : scenes.slice(0, i).reduce((sum, s) => sum + s.duration, 0) -
+            i * TRANSITION_DURATION + 0.1;
+      const delayMs = Math.round(visualStartTime * 1000);
+
       filters.push(
-        `[${vi}:a]adelay=${delay}|${delay},apad[vo${i}]`
+        `[${vi}:a]adelay=${delayMs}|${delayMs},apad[vo${i}]`
       );
       audioStreams.push(`[vo${i}]`);
     }
   }
 
-  // Background music
+  // Background music track
   if (musicInputIdx !== null) {
     filters.push(
       `[${musicInputIdx}:a]atrim=0:${totalDuration.toFixed(3)},volume=${musicVolume},apad[bgm]`
@@ -287,7 +321,7 @@ export async function renderWithFfmpeg(
     audioStreams.push(`[bgm]`);
   }
 
-  // Mix audio streams
+  // Mix all audio streams
   if (audioStreams.length > 1) {
     filters.push(
       `${audioStreams.join("")}amix=inputs=${audioStreams.length}:duration=first:dropout_transition=2[audio]`
@@ -305,11 +339,10 @@ export async function renderWithFfmpeg(
     args.push("-map", "[audio]");
   }
 
-  // Output encoding settings
   args.push(
     "-c:v", "libx264",
     "-preset", "fast",
-    "-crf", "23",
+    "-crf", "22",
     "-pix_fmt", "yuv420p",
     "-c:a", "aac",
     "-b:a", "128k",
@@ -318,7 +351,7 @@ export async function renderWithFfmpeg(
     outPath
   );
 
-  console.log(`[${jobId}][ffmpeg] Rendering ${scenes.length} scenes, ${totalDuration.toFixed(1)}s to ${outPath}...`);
+  console.log(`[${jobId}][ffmpeg] Rendering ${scenes.length} scenes with animations & Montserrat/Inter fonts to ${outPath}...`);
 
   return new Promise((resolve, reject) => {
     const proc = spawn("ffmpeg", args, { stdio: ["pipe", "pipe", "pipe"] });
